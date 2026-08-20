@@ -185,7 +185,8 @@ def main():
     dedup_window = config.get("dedup_window_minutes", 90)
     state = prune_state(state, dedup_window)
 
-    requester = YandexMapsRequester()
+    requester = YandexMapsRequester(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
 
     any_active = False
     for watch in config.get("watches", []):
