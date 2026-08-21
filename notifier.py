@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Проверяет расписание автобусов (через неофициальный, но напрямую вызываемый
-эндпоинт Яндекс.Карт) для остановок из config.yaml и шлёт уведомление в
-Telegram, когда нужный автобус приближается.
+Шлёт уведомление в Telegram, когда по ИЗВЕСТНОМУ (табличному) расписанию
+скоро отправляется нужный автобус.
 
-Задуман для запуска по расписанию (GitHub Actions / cron), а не как постоянно
-работающий процесс: при каждом запуске делает ОДНУ проверку по каждому "watch"
-из конфига и завершается.
+История: изначально скрипт пытался брать данные в реальном времени с
+Яндекс.Карт, но их неофициальный API оказался заблокирован для запросов с
+серверов вроде GitHub Actions (и вообще для "нечеловеческих" запросов) —
+подробности в README. Поэтому теперь бот работает проще и надёжнее: просто
+знает расписание автобуса (из config.yaml) и напоминает заранее. Это не
+учитывает реальные опоздания автобуса, зато ничего не может сломаться на
+стороне Яндекса.
 
-Состояние (какие автобусы уже показывали) хранится в state.json рядом со
-скриптом, чтобы не слать одно и то же уведомление на каждом прогоне.
+Задуман для запуска по расписанию (GitHub Actions / cron): при каждом
+запуске делает одну проверку по каждому "watch" из конфига и завершается.
+Состояние (какие рейсы уже показывали сегодня) хранится в state.json рядом
+со скриптом, чтобы не слать одно и то же уведомление на каждом прогоне.
 """
 
 import json
@@ -33,71 +38,6 @@ LOCAL_CONFIG_PATH = BASE_DIR / "config.local.yaml"  # необязательны
 STATE_PATH = BASE_DIR / "state.json"
 
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-class YandexTransportClient:
-    """
-    Небольшой самописный клиент к неофициальному эндпоинту Яндекс.Карт,
-    который отдаёт расписание/прогноз прибытия транспорта на остановке.
-
-    Работает в два шага (оба к одному и тому же URL):
-      1) запрос без csrfToken — Яндекс в ответ присылает свежий csrfToken
-         (и куки сессии, которые requests.Session хранит автоматически);
-      2) тот же запрос, но уже с csrfToken и ajax=1&mode=prognosis —
-         в ответ должны прийти реальные данные по остановке.
-
-    ВНИМАНИЕ: это неофициальный API, формат ответа может измениться в любой
-    момент без предупреждения. Если перестанет работать — смотри README.
-    """
-
-    BASE_URL = "https://yandex.ru/maps/api/masstransit/getStopInfo"
-
-    def __init__(self, user_agent: str = DEFAULT_UA):
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Referer": "https://yandex.ru/maps/",
-            }
-        )
-
-    def get_stop_info(self, stop_id):
-        stop_id_str = str(stop_id)
-        if not stop_id_str.startswith("stop__"):
-            stop_id_str = f"stop__{stop_id_str}"
-
-        # Шаг 0: заходим на саму страницу карт — без этого Яндекс не выдаёт
-        # полный набор кук сессии, и последующий запрос с csrfToken падает
-        # с 400 Bad Request, даже если сам токен формально верный.
-        self.session.get("https://maps.yandex.ru/", timeout=15)
-
-        base_params = {
-            "stopId": stop_id_str,
-            "locale": "ru",
-            "lang": "ru_RU",
-        }
-
-        r1 = self.session.get(self.BASE_URL, params=base_params, timeout=15)
-        r1.raise_for_status()
-        token = (r1.json() or {}).get("csrfToken")
-        if not token:
-            raise RuntimeError(f"Не удалось получить csrfToken. Ответ Яндекса: {r1.text[:300]}")
-
-        params2 = dict(base_params, ajax=1, mode="prognosis", csrfToken=token)
-        r2 = self.session.get(self.BASE_URL, params=params2, timeout=15)
-        if r2.status_code == 400:
-            raise RuntimeError(
-                f"Яндекс отклонил запрос с токеном (400 Bad Request). "
-                f"Возможно, у API снова изменились требования. Ответ: {r2.text[:300]}"
-            )
-        r2.raise_for_status()
-        return r2.json()
 
 
 def load_config():
@@ -140,13 +80,6 @@ def prune_state(state, dedup_window_minutes):
     return state
 
 
-def parse_hours_range(hours_range: str):
-    start_s, end_s = hours_range.split("-")
-    start_h, start_m = (int(x) for x in start_s.strip().split(":"))
-    end_h, end_m = (int(x) for x in end_s.strip().split(":"))
-    return (start_h, start_m), (end_h, end_m)
-
-
 def parse_weekdays(weekdays: str):
     weekdays = weekdays.strip().lower()
     if "-" in weekdays and "," not in weekdays:
@@ -154,61 +87,6 @@ def parse_weekdays(weekdays: str):
         start_i, end_i = WEEKDAY_NAMES.index(start), WEEKDAY_NAMES.index(end)
         return set(WEEKDAY_NAMES[start_i : end_i + 1])
     return {d.strip() for d in weekdays.split(",")}
-
-
-def is_active_now(watch, now_local: datetime) -> bool:
-    active_weekdays = parse_weekdays(watch.get("active_weekdays", "mon-sun"))
-    if WEEKDAY_NAMES[now_local.weekday()] not in active_weekdays:
-        return False
-
-    hours_range = watch.get("active_hours")
-    if not hours_range:
-        return True
-
-    (start_h, start_m), (end_h, end_m) = parse_hours_range(hours_range)
-    start = now_local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-    end = now_local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-    return start <= now_local <= end
-
-
-def fetch_stop_events(client: YandexTransportClient, stop_id, debug: bool = False):
-    """
-    Возвращает список (route_name, eta_epoch_seconds, vehicle_id_or_None).
-
-    Структура ответа Яндекса (неофициальная, может меняться!):
-    data.properties.StopMetaData.Transport -> [ { name, BriefSchedule: { Events: [
-        { Estimated?: {value, text, vehicleId}, Scheduled?: {value, text} }, ... ] } }, ... ]
-    """
-    raw = client.get_stop_info(stop_id)
-
-    if debug:
-        print(json.dumps(raw, ensure_ascii=False, indent=2)[:4000])
-
-    if not raw or "data" not in raw:
-        raise RuntimeError(
-            f"Неожиданный ответ от Яндекса для stop_id={stop_id} (нет ключа 'data'): "
-            f"{json.dumps(raw, ensure_ascii=False)[:300]}"
-        )
-
-    try:
-        transport_list = raw["data"]["properties"]["StopMetaData"]["Transport"]
-    except (KeyError, TypeError) as exc:
-        raise RuntimeError(
-            f"Не нашёл ожидаемых полей в ответе Яндекса (формат мог поменяться): {exc}\n"
-            f"Запустите с --debug, чтобы увидеть сырой JSON."
-        )
-
-    events = []
-    for route in transport_list:
-        route_name = str(route.get("name", "")).strip()
-        schedule_events = (route.get("BriefSchedule") or {}).get("Events") or []
-        for ev in schedule_events:
-            slot = ev.get("Estimated") or ev.get("Scheduled")
-            if not slot or "value" not in slot:
-                continue
-            events.append((route_name, slot["value"], slot.get("vehicleId")))
-
-    return events
 
 
 def send_telegram_message(bot_token: str, chat_id: str, text: str):
@@ -224,12 +102,12 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str):
 
 
 def main():
-    debug = "--debug" in sys.argv
     dry_run = "--dry-run" in sys.argv  # проверить логику, не слать в Telegram
 
     config = load_config()
     tz = ZoneInfo(config.get("timezone", "Asia/Novosibirsk"))
     now_local = datetime.now(tz)
+    today = now_local.date()
 
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or config.get("telegram", {}).get("bot_token")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or config.get("telegram", {}).get("chat_id")
@@ -243,52 +121,34 @@ def main():
         sys.exit(1)
 
     state = load_state()
-    dedup_window = config.get("dedup_window_minutes", 90)
+    dedup_window = config.get("dedup_window_minutes", 600)
     state = prune_state(state, dedup_window)
 
-    client = YandexTransportClient()
-
-    any_active = False
     for watch in config.get("watches", []):
         name = watch["name"]
 
-        if not is_active_now(watch, now_local):
-            continue
-        any_active = True
-
-        stop_id = watch["stop_id"]
-        if not stop_id or stop_id == 0:
-            print(f"[{name}] stop_id не заполнен в config.yaml — пропускаю.")
+        active_weekdays = parse_weekdays(watch.get("active_weekdays", "mon-sun"))
+        if WEEKDAY_NAMES[now_local.weekday()] not in active_weekdays:
             continue
 
-        wanted_routes = {str(r) for r in watch.get("routes") or []}
-        threshold_min = watch.get("notify_before_minutes", 7)
-
-        try:
-            events = fetch_stop_events(client, stop_id, debug=debug)
-        except Exception as exc:  # noqa: BLE001 - хотим просто залогировать и продолжить
-            print(f"[{name}] Ошибка при запросе к Яндексу: {exc}", file=sys.stderr)
-            continue
-
+        threshold_min = watch.get("notify_before_minutes", 10)
         watch_state = state.setdefault(name, {})
 
-        for route_name, eta_epoch, vehicle_id in events:
-            if wanted_routes and route_name not in wanted_routes:
-                continue
+        for dep_str in watch.get("departures", []):
+            hour, minute = (int(x) for x in dep_str.strip().split(":"))
+            dep_dt = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-            minutes_left = (eta_epoch - time.time()) / 60
+            minutes_left = (dep_dt - now_local).total_seconds() / 60
             if minutes_left < -1 or minutes_left > threshold_min:
-                continue  # ещё далеко или уже уехал
+                continue  # рейс уже уехал или ещё не скоро
 
-            dedup_key = f"{route_name}:{vehicle_id or round(eta_epoch / 60)}"
+            dedup_key = f"{today.isoformat()}:{dep_str}"
             if dedup_key in watch_state:
-                continue
+                continue  # про этот рейс уже напоминали сегодня
 
-            eta_text = (datetime.fromtimestamp(eta_epoch, tz)).strftime("%H:%M")
             text = (
                 f"🚌 <b>{name}</b>\n"
-                f"Автобус <b>{route_name}</b> будет через ~{max(0, round(minutes_left))} мин "
-                f"(≈{eta_text})"
+                f"Автобус по расписанию в {dep_str} — через ~{max(0, round(minutes_left))} мин."
             )
             print(text.replace("\n", " | "))
 
@@ -296,9 +156,6 @@ def main():
                 send_telegram_message(bot_token, chat_id, text)
 
             watch_state[dedup_key] = {"notified_at": time.time()}
-
-    if not any_active and debug:
-        print("Сейчас нет ни одного активного watch (вне заданных active_hours/active_weekdays).")
 
     save_state(state)
 
