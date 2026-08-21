@@ -72,6 +72,11 @@ class YandexTransportClient:
         if not stop_id_str.startswith("stop__"):
             stop_id_str = f"stop__{stop_id_str}"
 
+        # Шаг 0: заходим на саму страницу карт — без этого Яндекс не выдаёт
+        # полный набор кук сессии, и последующий запрос с csrfToken падает
+        # с 400 Bad Request, даже если сам токен формально верный.
+        self.session.get("https://maps.yandex.ru/", timeout=15)
+
         base_params = {
             "stopId": stop_id_str,
             "locale": "ru",
@@ -86,6 +91,11 @@ class YandexTransportClient:
 
         params2 = dict(base_params, ajax=1, mode="prognosis", csrfToken=token)
         r2 = self.session.get(self.BASE_URL, params=params2, timeout=15)
+        if r2.status_code == 400:
+            raise RuntimeError(
+                f"Яндекс отклонил запрос с токеном (400 Bad Request). "
+                f"Возможно, у API снова изменились требования. Ответ: {r2.text[:300]}"
+            )
         r2.raise_for_status()
         return r2.json()
 
