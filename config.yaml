@@ -30,7 +30,7 @@ watches:
     #   про автобус не в ту сторону.
     routes: ["114", "220"]
     notify_before_minutes: 10
-    active_hours: "05:30-09:00"
+    active_hours: "05:30-12:00"
     active_weekdays: "mon-fri"
 
   - name: "Вечер — Сад Дзержинского → Берёзовая роща/Пл.Маркса"
