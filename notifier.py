@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Проверяет расписание автобусов (через неофициальный API Яндекс.Карт, библиотека
-ya_ma) для остановок из config.yaml и шлёт уведомление в Telegram, когда нужный
-автобус приближается.
+Проверяет расписание автобусов (через неофициальный, но напрямую вызываемый
+эндпоинт Яндекс.Карт) для остановок из config.yaml и шлёт уведомление в
+Telegram, когда нужный автобус приближается.
 
 Задуман для запуска по расписанию (GitHub Actions / cron), а не как постоянно
 работающий процесс: при каждом запуске делает ОДНУ проверку по каждому "watch"
@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -27,22 +27,67 @@ try:
 except ImportError:  # Python <3.9 fallback, не должно понадобиться
     from backports.zoneinfo import ZoneInfo
 
-try:
-    from ya_ma import YandexMapsRequester
-except ImportError:
-    print(
-        "Не найден пакет ya_ma. Установите зависимости:\n"
-        "    pip install -r requirements.txt\n",
-        file=sys.stderr,
-    )
-    raise
-
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 LOCAL_CONFIG_PATH = BASE_DIR / "config.local.yaml"  # необязательный, для локальных секретов
 STATE_PATH = BASE_DIR / "state.json"
 
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+class YandexTransportClient:
+    """
+    Небольшой самописный клиент к неофициальному эндпоинту Яндекс.Карт,
+    который отдаёт расписание/прогноз прибытия транспорта на остановке.
+
+    Работает в два шага (оба к одному и тому же URL):
+      1) запрос без csrfToken — Яндекс в ответ присылает свежий csrfToken
+         (и куки сессии, которые requests.Session хранит автоматически);
+      2) тот же запрос, но уже с csrfToken и ajax=1&mode=prognosis —
+         в ответ должны прийти реальные данные по остановке.
+
+    ВНИМАНИЕ: это неофициальный API, формат ответа может измениться в любой
+    момент без предупреждения. Если перестанет работать — смотри README.
+    """
+
+    BASE_URL = "https://yandex.ru/maps/api/masstransit/getStopInfo"
+
+    def __init__(self, user_agent: str = DEFAULT_UA):
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://yandex.ru/maps/",
+            }
+        )
+
+    def get_stop_info(self, stop_id):
+        stop_id_str = str(stop_id)
+        if not stop_id_str.startswith("stop__"):
+            stop_id_str = f"stop__{stop_id_str}"
+
+        base_params = {
+            "stopId": stop_id_str,
+            "locale": "ru",
+            "lang": "ru_RU",
+        }
+
+        r1 = self.session.get(self.BASE_URL, params=base_params, timeout=15)
+        r1.raise_for_status()
+        token = (r1.json() or {}).get("csrfToken")
+        if not token:
+            raise RuntimeError(f"Не удалось получить csrfToken. Ответ Яндекса: {r1.text[:300]}")
+
+        params2 = dict(base_params, ajax=1, mode="prognosis", csrfToken=token)
+        r2 = self.session.get(self.BASE_URL, params=params2, timeout=15)
+        r2.raise_for_status()
+        return r2.json()
 
 
 def load_config():
@@ -52,7 +97,6 @@ def load_config():
     if LOCAL_CONFIG_PATH.exists():
         with open(LOCAL_CONFIG_PATH, "r", encoding="utf-8") as f:
             local = yaml.safe_load(f) or {}
-        # Простое поверхностное слияние — достаточно для секции telegram.
         for key, value in local.items():
             if isinstance(value, dict) and isinstance(config.get(key), dict):
                 config[key].update(value)
@@ -117,17 +161,24 @@ def is_active_now(watch, now_local: datetime) -> bool:
     return start <= now_local <= end
 
 
-def fetch_stop_events(requester: YandexMapsRequester, stop_id: int, debug: bool = False):
+def fetch_stop_events(client: YandexTransportClient, stop_id, debug: bool = False):
     """
     Возвращает список (route_name, eta_epoch_seconds, vehicle_id_or_None).
+
+    Структура ответа Яндекса (неофициальная, может меняться!):
+    data.properties.StopMetaData.Transport -> [ { name, BriefSchedule: { Events: [
+        { Estimated?: {value, text, vehicleId}, Scheduled?: {value, text} }, ... ] } }, ... ]
     """
-    raw = requester.get_stop_info(stop_id)
+    raw = client.get_stop_info(stop_id)
 
     if debug:
         print(json.dumps(raw, ensure_ascii=False, indent=2)[:4000])
 
     if not raw or "data" not in raw:
-        raise RuntimeError(f"Неожиданный ответ от Яндекса для stop_id={stop_id}: {raw}")
+        raise RuntimeError(
+            f"Неожиданный ответ от Яндекса для stop_id={stop_id} (нет ключа 'data'): "
+            f"{json.dumps(raw, ensure_ascii=False)[:300]}"
+        )
 
     try:
         transport_list = raw["data"]["properties"]["StopMetaData"]["Transport"]
@@ -164,7 +215,7 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str):
 
 def main():
     debug = "--debug" in sys.argv
-    dry_run = "--dry-run" in sys.argv
+    dry_run = "--dry-run" in sys.argv  # проверить логику, не слать в Telegram
 
     config = load_config()
     tz = ZoneInfo(config.get("timezone", "Asia/Novosibirsk"))
@@ -185,8 +236,7 @@ def main():
     dedup_window = config.get("dedup_window_minutes", 90)
     state = prune_state(state, dedup_window)
 
-    requester = YandexMapsRequester(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    client = YandexTransportClient()
 
     any_active = False
     for watch in config.get("watches", []):
@@ -205,8 +255,8 @@ def main():
         threshold_min = watch.get("notify_before_minutes", 7)
 
         try:
-            events = fetch_stop_events(requester, stop_id, debug=debug)
-        except Exception as exc:  # noqa: BLE001
+            events = fetch_stop_events(client, stop_id, debug=debug)
+        except Exception as exc:  # noqa: BLE001 - хотим просто залогировать и продолжить
             print(f"[{name}] Ошибка при запросе к Яндексу: {exc}", file=sys.stderr)
             continue
 
@@ -218,7 +268,7 @@ def main():
 
             minutes_left = (eta_epoch - time.time()) / 60
             if minutes_left < -1 or minutes_left > threshold_min:
-                continue
+                continue  # ещё далеко или уже уехал
 
             dedup_key = f"{route_name}:{vehicle_id or round(eta_epoch / 60)}"
             if dedup_key in watch_state:
